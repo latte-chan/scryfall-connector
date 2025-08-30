@@ -11,6 +11,37 @@ export function createMcpServer(): any {
         { capabilities: { tools: {} } }
     );
 
+    // Helper: build Scryfall query strings safely
+    const quote = (v: string): string =>
+        /\s|\"|:/.test(v) ? `"${v.replaceAll("\"", '\\"')}"` : v;
+    const joinParts = (parts: Array<string | undefined>): string => parts.filter(Boolean).join(" ");
+    const cardSummaryShape = {
+        name: z.string(),
+        mana_cost: z.string().optional(),
+        type_line: z.string(),
+        oracle_text: z.string().optional(),
+        set: z.string(),
+        collector_number: z.string(),
+        scryfall_uri: z.string().url(),
+        image: z.string().url().optional(),
+        prices: z
+            .object({ usd: z.string().nullable().optional(), eur: z.string().nullable().optional(), tix: z.string().nullable().optional() })
+            .partial()
+            .optional()
+    } as const;
+    type CardSummary = z.infer<z.ZodObject<typeof cardSummaryShape>>;
+    const summarize = (card: any): CardSummary => ({
+        name: card?.name,
+        mana_cost: card?.mana_cost,
+        type_line: card?.type_line,
+        oracle_text: card?.oracle_text,
+        set: card?.set,
+        collector_number: String(card?.collector_number ?? ""),
+        scryfall_uri: card?.scryfall_uri,
+        image: card?.image_uris?.normal ?? card?.image_uris?.large ?? card?.image_uris?.small,
+        prices: card?.prices
+    });
+
     // Tool: search_cards
     // Zod shapes for MCPServer (use raw shapes, not ZodObject)
     const searchParamsShape = {
@@ -51,6 +82,110 @@ export function createMcpServer(): any {
         async (params: SearchParams): Promise<ToolResult> => {
             const data: unknown = await Scryfall.searchCards(params);
             return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] } as any;
+        }
+    );
+
+    // Tool: search_by_colors
+    const searchByColorsInput = {
+        colors: z.array(z.enum(["W", "U", "B", "R", "G"])).min(0).max(5).optional(),
+        mode: z.enum(["exact", "contains", "at_most"]).default("contains"),
+        include_colorless: z.boolean().optional().describe("Include colorless cards"),
+        identity: z.boolean().optional().describe("Filter by color identity instead of printed colors"),
+        page: z.number().int().min(1).optional()
+    } as const;
+    const searchByColorsOutput = {
+        total: z.number().int().nonnegative(),
+        results: z.array(z.object(cardSummaryShape))
+    } as const;
+    server.registerTool(
+        "search_by_colors",
+        {
+            title: "Search by colors",
+            description: "Find cards by colors or color identity.",
+            inputSchema: searchByColorsInput,
+            outputSchema: searchByColorsOutput
+        },
+        async ({ colors = [], mode, include_colorless, identity, page }: { colors?: Array<"W" | "U" | "B" | "R" | "G">; mode: "exact" | "contains" | "at_most"; include_colorless?: boolean; identity?: boolean; page?: number }) => {
+            const op = mode === "exact" ? "=" : mode === "contains" ? ">=" : "<=";
+            const opKey = identity ? "c" : "color"; // c = color identity
+            const parts = [colors.length ? `${opKey}${op}${colors.join("")}` : undefined, include_colorless ? "is:colorless" : undefined];
+            const q = joinParts(parts);
+            const data: any = (await Scryfall.searchCards({ q, page })) as any;
+            const items: any[] = Array.isArray(data?.data) ? data.data : [];
+            const out = { total: Number(data?.total_cards ?? items.length), results: items.map(summarize) };
+            return { structuredContent: out } as any;
+        }
+    );
+
+    // Tool: search_by_cmc (mana value)
+    const searchByCmcInput = {
+        min: z.number().int().min(0).optional(),
+        max: z.number().int().min(0).optional(),
+        colors: z.array(z.enum(["W", "U", "B", "R", "G"])).min(0).max(5).optional(),
+        type: z.string().optional(),
+        page: z.number().int().min(1).optional()
+    } as const;
+    const searchByCmcOutput = searchByColorsOutput;
+    server.registerTool(
+        "search_by_cmc",
+        {
+            title: "Search by mana value",
+            description: "Find cards within a mana value range, optionally filtered by color and type.",
+            inputSchema: searchByCmcInput,
+            outputSchema: searchByCmcOutput
+        },
+        async ({ min, max, colors = [], type, page }: { min?: number; max?: number; colors?: Array<"W" | "U" | "B" | "R" | "G">; type?: string; page?: number }) => {
+            const range = [typeof min === "number" ? `mv>=${min}` : undefined, typeof max === "number" ? `mv<=${max}` : undefined];
+            const colorPart = colors.length ? `color>=${colors.join("")}` : undefined;
+            const typePart = type ? `type:${quote(type)}` : undefined;
+            const q = joinParts([...range, colorPart, typePart]);
+            const data: any = (await Scryfall.searchCards({ q, page })) as any;
+            const items: any[] = Array.isArray(data?.data) ? data.data : [];
+            const out = { total: Number(data?.total_cards ?? items.length), results: items.map(summarize) };
+            return { structuredContent: out } as any;
+        }
+    );
+
+    // Tool: search_by_format legality
+    const formats = [
+        "standard",
+        "pioneer",
+        "modern",
+        "legacy",
+        "vintage",
+        "commander",
+        "oathbreaker",
+        "pauper",
+        "paupercommander",
+        "historic",
+        "timeless",
+        "alchemy",
+        "brawl",
+        "duel",
+        "predh"
+    ] as const;
+    const searchByFormatInput = {
+        format: z.enum(formats),
+        status: z.enum(["legal", "banned", "restricted"]).default("legal"),
+        colors: z.array(z.enum(["W", "U", "B", "R", "G"])).min(0).max(5).optional(),
+        page: z.number().int().min(1).optional()
+    } as const;
+    server.registerTool(
+        "search_by_format",
+        {
+            title: "Search by format legality",
+            description: "Find cards by legality in a given format.",
+            inputSchema: searchByFormatInput,
+            outputSchema: searchByColorsOutput
+        },
+        async ({ format, status, colors = [], page }: { format: typeof formats[number]; status: "legal" | "banned" | "restricted"; colors?: Array<"W" | "U" | "B" | "R" | "G">; page?: number }) => {
+            const legal = `${status}:${format}`; // e.g., legal:commander
+            const colorPart = colors.length ? `color>=${colors.join("")}` : undefined;
+            const q = joinParts([legal, colorPart]);
+            const data: any = (await Scryfall.searchCards({ q, page })) as any;
+            const items: any[] = Array.isArray(data?.data) ? data.data : [];
+            const out = { total: Number(data?.total_cards ?? items.length), results: items.map(summarize) };
+            return { structuredContent: out } as any;
         }
     );
 
