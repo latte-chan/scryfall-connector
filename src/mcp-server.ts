@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { Scryfall, type SearchParams } from "./scryfall.js";
+import { fetchTaggerTags, toKebabTag } from "./tags.js";
 
 type JsonContent = { type: "json"; json: unknown };
 type ToolResult = { content: JsonContent[] };
@@ -265,6 +266,100 @@ export function createMcpServer(): any {
         async ({ id }: { id: string }): Promise<ToolResult> => {
             const data: unknown = await Scryfall.getRulingsById(id);
             return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] } as any;
+        }
+    );
+
+    // Tool: list_tagger_tags (scrapes public docs)
+    const listTaggerTagsOutput = {
+        function: z.array(z.string()),
+        art: z.array(z.string())
+    } as const;
+    server.registerTool(
+        "list_tagger_tags",
+        {
+            title: "List Tagger tags",
+            description: "Fetches Scryfall Tagger tag names from the public docs page.",
+            outputSchema: listTaggerTagsOutput
+        },
+        async () => {
+            const tags = await fetchTaggerTags();
+            return { structuredContent: tags } as any;
+        }
+    );
+
+    // Tool: search_by_function_tag
+    const searchByFuncTagInput = {
+        tags: z.array(z.string()).min(1),
+        match: z.enum(["any", "all"]).default("any"),
+        colors: z.array(z.enum(["W", "U", "B", "R", "G"])).min(0).max(5).optional(),
+        format: z
+            .enum([
+                "standard",
+                "pioneer",
+                "modern",
+                "legacy",
+                "vintage",
+                "commander",
+                "oathbreaker",
+                "pauper",
+                "paupercommander",
+                "historic",
+                "timeless",
+                "alchemy",
+                "brawl",
+                "duel",
+                "predh"
+            ])
+            .optional(),
+        page: z.number().int().min(1).optional()
+    } as const;
+    server.registerTool(
+        "search_by_function_tag",
+        {
+            title: "Search by function tag",
+            description: "Find cards using Tagger function (oracle) tags, e.g. removal, ramp.",
+            inputSchema: searchByFuncTagInput,
+            outputSchema: searchByColorsOutput
+        },
+        async ({ tags, match, colors = [], format, page }: { tags: string[]; match: "any" | "all"; colors?: Array<"W" | "U" | "B" | "R" | "G">; format?: string; page?: number }) => {
+            const terms = tags.map((t) => `otag:${toKebabTag(t)}`);
+            const joined = match === "all" ? terms.join(" ") : terms.join(" OR ");
+            const colorPart = colors.length ? `color>=${colors.join("")}` : undefined;
+            const formatPart = format ? `legal:${format}` : undefined;
+            const q = joinParts([joined, colorPart, formatPart]);
+            const data: any = (await Scryfall.searchCards({ q, page })) as any;
+            const items: any[] = Array.isArray(data?.data) ? data.data : [];
+            const out = { total: Number(data?.total_cards ?? items.length), results: items.map(summarize) };
+            return { structuredContent: out } as any;
+        }
+    );
+
+    // Tool: search_by_art_tag
+    const searchByArtTagInput = {
+        tags: z.array(z.string()).min(1),
+        match: z.enum(["any", "all"]).default("any"),
+        colors: z.array(z.enum(["W", "U", "B", "R", "G"])).min(0).max(5).optional(),
+        type: z.string().optional(),
+        page: z.number().int().min(1).optional()
+    } as const;
+    server.registerTool(
+        "search_by_art_tag",
+        {
+            title: "Search by art tag",
+            description: "Find cards using Tagger artwork tags, e.g. squirrel, dragon, wizard.",
+            inputSchema: searchByArtTagInput,
+            outputSchema: searchByColorsOutput
+        },
+        async ({ tags, match, colors = [], type, page }: { tags: string[]; match: "any" | "all"; colors?: Array<"W" | "U" | "B" | "R" | "G">; type?: string; page?: number }) => {
+            const terms = tags.map((t) => `arttag:${toKebabTag(t)}`);
+            const joined = match === "all" ? terms.join(" ") : terms.join(" OR ");
+            const colorPart = colors.length ? `color>=${colors.join("")}` : undefined;
+            const typePart = type ? `type:${quote(type)}` : undefined;
+            const q = joinParts([joined, colorPart, typePart]);
+            const data: any = (await Scryfall.searchCards({ q, page })) as any;
+            const items: any[] = Array.isArray(data?.data) ? data.data : [];
+            const out = { total: Number(data?.total_cards ?? items.length), results: items.map(summarize) };
+            return { structuredContent: out } as any;
         }
     );
 
