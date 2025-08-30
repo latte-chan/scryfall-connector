@@ -11,22 +11,63 @@ function buildUrl(path: string, params?: Record<string, unknown>, base = DEFAULT
     return url;
 }
 
+// Simple polite rate limiter per Scryfall guidelines (~10 req/s)
+const intervalMs = Number(process.env.SCRYFALL_INTERVAL_MS || 100);
+let lastStart = 0;
+let queue: Promise<void> = Promise.resolve();
+
+function sleep(ms: number) {
+    return new Promise((r) => setTimeout(r, ms));
+}
+
+async function acquireSlot(): Promise<void> {
+    const prev = queue;
+    let release: () => void;
+    const next = new Promise<void>((r) => (release = r));
+    queue = next;
+    await prev;
+    const now = Date.now();
+    const wait = Math.max(0, lastStart + intervalMs - now);
+    if (wait > 0) await sleep(wait);
+    lastStart = Date.now();
+    release!();
+}
+
 async function getJson(path: string, params?: Record<string, unknown>) {
     const base = process.env.SCRYFALL_BASE_URL || DEFAULT_BASE_URL;
     const url = buildUrl(path, params, base);
 
-    const res = await fetch(url, {
-        headers: {
-            // Courtesy header for Scryfall logs; adjust URL if you publish this.
-            "User-Agent": "scryfall-mcp/0.1 (https://github.com/latte-chan/scryfall-connector)"
-        }
-    });
+    const maxRetries = Number(process.env.SCRYFALL_MAX_RETRIES || 3);
+    const retryBaseMs = Number(process.env.SCRYFALL_RETRY_BASE_MS || 250);
 
-    if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        throw new Error(`Scryfall request failed: ${res.status} ${res.statusText} - ${text}`);
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        await acquireSlot();
+        const res = await fetch(url, {
+            headers: {
+                // Required by Scryfall API usage guidelines
+                "User-Agent": "scryfall-mcp/0.1 (https://github.com/latte-chan/scryfall-connector)"
+            }
+        });
+
+        if (res.status === 429) {
+            const retryAfter = Number(res.headers.get("Retry-After") || 0);
+            const backoff = retryAfter > 0 ? retryAfter * 1000 : retryBaseMs * Math.pow(2, attempt);
+            if (attempt < maxRetries) {
+                await sleep(backoff);
+                continue;
+            }
+        }
+
+        if (!res.ok) {
+            const text = await res.text().catch(() => "");
+            throw new Error(`Scryfall request failed: ${res.status} ${res.statusText} - ${text}`);
+        }
+
+        return res.json() as Promise<unknown>;
     }
-    return res.json() as Promise<unknown>;
+
+    // Should not reach here due to return/throw above
+    throw new Error("Scryfall request failed after retries");
 }
 
 export type SearchParams = {
@@ -67,4 +108,3 @@ export const Scryfall = {
 };
 
 export type ScryfallAPI = typeof Scryfall;
-
