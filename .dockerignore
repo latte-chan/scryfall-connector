@@ -1,0 +1,19 @@
+# Ignore dev artifacts
+node_modules
+npm-debug.log*
+yarn-error.log*
+
+# Editor/OS
+.DS_Store
+.vscode
+.idea
+
+# Git
+.git
+.gitignore
+
+# Local caches
+cache
+
+# Build output (rebuilt in container)
+dist
