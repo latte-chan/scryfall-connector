@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { Scryfall, type SearchParams } from "./scryfall.js";
-import { fetchTaggerTags, toKebabTag } from "./tags.js";
+import { fetchTaggerTags, toKebabTag, readTaggerCache, refreshTaggerTags } from "./tags.js";
 
 type JsonContent = { type: "json"; json: unknown };
 type ToolResult = { content: JsonContent[] };
@@ -284,6 +284,54 @@ export function createMcpServer(): any {
         async () => {
             const tags = await fetchTaggerTags();
             return { structuredContent: tags } as any;
+        }
+    );
+
+    // Tool: read_tagger_cache (no network)
+    const readTaggerCacheOutput = {
+        function: z.array(z.string()),
+        art: z.array(z.string()),
+        cachedAtMs: z.number(),
+        cachePath: z.string()
+    } as const;
+    server.registerTool(
+        "read_tagger_cache",
+        {
+            title: "Read Tagger cache",
+            description: "Read tags from local cache file without network.",
+            outputSchema: readTaggerCacheOutput
+        },
+        async () => {
+            const cached = await readTaggerCache();
+            if (!cached) {
+                return { content: [{ type: "text", text: "No cache found" }] } as any;
+            }
+            return {
+                structuredContent: {
+                    function: cached.data.function,
+                    art: cached.data.art,
+                    cachedAtMs: cached.at,
+                    cachePath: process.env.TAGGER_CACHE_PATH || require('node:path').join(process.cwd(), 'cache', 'tagger-tags.json')
+                }
+            } as any;
+        }
+    );
+
+    // Tool: refresh_tagger_tags (force network + write cache)
+    const refreshTaggerTagsOutput = {
+        path: z.string(),
+        counts: z.object({ function: z.number().int().nonnegative(), art: z.number().int().nonnegative() })
+    } as const;
+    server.registerTool(
+        "refresh_tagger_tags",
+        {
+            title: "Refresh Tagger tags",
+            description: "Force refresh Tagger tags from docs and write local cache.",
+            outputSchema: refreshTaggerTagsOutput
+        },
+        async () => {
+            const res = await refreshTaggerTags();
+            return { structuredContent: res } as any;
         }
     );
 
