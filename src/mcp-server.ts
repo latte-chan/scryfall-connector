@@ -2,6 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { Scryfall, type SearchParams } from "./scryfall.js";
 import { fetchTaggerTags, toKebabTag, readTaggerCache, refreshTaggerTags } from "./tags.js";
+import { CSB } from "./csb.js";
+import { loadCsbIndex, writeCsbIndex, readCsbIndex, buildCsbIndex, lookupCsbIdsByOracle } from "./csb-index.js";
 
 type JsonContent = { type: "json"; json: unknown };
 type ToolResult = { content: JsonContent[] };
@@ -408,6 +410,184 @@ export function createMcpServer(): any {
             const items: any[] = Array.isArray(data?.data) ? data.data : [];
             const out = { total: Number(data?.total_cards ?? items.length), results: items.map(summarize) };
             return { structuredContent: out } as any;
+        }
+    );
+
+    // Commander Spellbook tools
+    // csb_parse_deck_text
+    const csbParseDeckInput = {
+        text: z.string().min(1).describe("Plain-text deck list, e.g. '1x Sol Ring' per line")
+    } as const;
+    const csbParseDeckOutput = {
+        main: z.array(z.object({ card: z.string(), quantity: z.number().int().positive() })),
+        commanders: z.array(z.object({ card: z.string(), quantity: z.number().int().positive() })).optional()
+    } as const;
+    server.registerTool(
+        "csb_parse_deck_text",
+        {
+            title: "CSB: Parse deck text",
+            description: "Parse a plain-text decklist into cards using Commander Spellbook.",
+            inputSchema: csbParseDeckInput,
+            outputSchema: csbParseDeckOutput
+        },
+        async ({ text }: { text: string }) => {
+            const res = (await CSB.parseCardListFromText(text)) as any;
+            return { structuredContent: res } as any;
+        }
+    );
+
+    // csb_find_combos_by_card_ids
+    const csbFindCombosInput = {
+        ids: z.array(z.number().int().nonnegative()).min(1).describe("Commander Spellbook numeric card IDs"),
+        limit: z.number().int().min(1).max(100).optional(),
+        offset: z.number().int().min(0).optional()
+    } as const;
+    server.registerTool(
+        "csb_find_combos_by_card_ids",
+        {
+            title: "CSB: Find combos by card IDs",
+            description: "Find combos that the provided cards enable (exact and almost-included).",
+            inputSchema: csbFindCombosInput
+        },
+        async ({ ids, limit, offset }: { ids: number[]; limit?: number; offset?: number }) => {
+            const res = await CSB.findMyCombos(ids, limit, offset);
+            return { structuredContent: res } as any;
+        }
+    );
+
+    // csb_variants_search
+    const csbVariantsSearchInput = {
+        uses: z.number().int().nonnegative().optional().describe("Filter variants that use this CSB card ID"),
+        produces: z.number().int().nonnegative().optional().describe("Filter variants that produce this feature ID (e.g., Win the game = 2)"),
+        of: z.number().int().nonnegative().optional().describe("Filter variants that are of a specific combo ID group"),
+        limit: z.number().int().min(1).max(100).optional(),
+        offset: z.number().int().min(0).optional()
+    } as const;
+    server.registerTool(
+        "csb_variants_search",
+        {
+            title: "CSB: Search variants",
+            description: "Search Commander Spellbook variants (combos) by filters like uses/produces.",
+            inputSchema: csbVariantsSearchInput
+        },
+        async ({ uses, produces, of, limit, offset }: { uses?: number; produces?: number; of?: number; limit?: number; offset?: number }) => {
+            const res = await CSB.variants({ uses, produces, of, limit, offset });
+            return { structuredContent: res } as any;
+        }
+    );
+
+    // csb_card
+    const csbCardInput = { id: z.number().int().positive() } as const;
+    server.registerTool(
+        "csb_card",
+        {
+            title: "CSB: Get card",
+            description: "Fetch Commander Spellbook card by numeric ID.",
+            inputSchema: csbCardInput
+        },
+        async ({ id }: { id: number }) => {
+            const res = await CSB.getCard(id);
+            return { structuredContent: res } as any;
+        }
+    );
+
+    // csb_build_card_index (force rebuild + write cache)
+    const csbBuildIndexOutput = {
+        path: z.string(),
+        total: z.number().int().nonnegative(),
+        size: z.number().int().nonnegative(),
+        builtAtMs: z.number()
+    } as const;
+    server.registerTool(
+        "csb_build_card_index",
+        {
+            title: "CSB: Build card index",
+            description: "Rebuild oracleId→CSB id index and write cache.",
+            outputSchema: csbBuildIndexOutput
+        },
+        async () => {
+            const data = await buildCsbIndex();
+            const path = await writeCsbIndex(data);
+            return { structuredContent: { path, total: data.total, size: Object.keys(data.oracleToId).length, builtAtMs: data.builtAtMs } } as any;
+        }
+    );
+
+    // csb_read_card_index (no network)
+    const csbReadIndexOutput = {
+        path: z.string(),
+        total: z.number().int().nonnegative(),
+        size: z.number().int().nonnegative(),
+        cachedAtMs: z.number()
+    } as const;
+    server.registerTool(
+        "csb_read_card_index",
+        {
+            title: "CSB: Read card index",
+            description: "Read oracleId→CSB id index from local cache.",
+            outputSchema: csbReadIndexOutput
+        },
+        async () => {
+            const cachePath = process.env.CSB_CARD_INDEX_PATH || require('node:path').join(process.cwd(), 'cache', 'csb-card-index.json');
+            const disk = await readCsbIndex(cachePath);
+            if (!disk) return { content: [{ type: "text", text: "No CSB card index cache found" }] } as any;
+            const size = Object.keys(disk.data.oracleToId || {}).length;
+            return { structuredContent: { path: cachePath, total: disk.data.total, size, cachedAtMs: disk.at } } as any;
+        }
+    );
+
+    // csb_lookup_by_oracle_ids
+    const csbLookupOracleInput = { oracleIds: z.array(z.string().uuid()).min(1) } as const;
+    const csbLookupOracleOutput = { found: z.record(z.string(), z.number().int()), missing: z.array(z.string()) } as const;
+    server.registerTool(
+        "csb_lookup_by_oracle_ids",
+        {
+            title: "CSB: Lookup by oracle IDs",
+            description: "Map Scryfall oracle_id UUIDs to Commander Spellbook numeric IDs using the local index (builds if stale).",
+            inputSchema: csbLookupOracleInput,
+            outputSchema: csbLookupOracleOutput
+        },
+        async ({ oracleIds }: { oracleIds: string[] }) => {
+            const res = await lookupCsbIdsByOracle(oracleIds);
+            return { structuredContent: res } as any;
+        }
+    );
+
+    // csb_find_combos_by_names
+    const csbFindByNamesInput = {
+        names: z.array(z.string()).min(1),
+        fuzzy: z.boolean().optional().describe("Use Scryfall fuzzy name matching; default true"),
+        limit: z.number().int().min(1).max(100).optional(),
+        offset: z.number().int().min(0).optional()
+    } as const;
+    server.registerTool(
+        "csb_find_combos_by_names",
+        {
+            title: "CSB: Find combos by card names",
+            description: "Resolve names via Scryfall → oracle_id, map to CSB IDs via cached index, then call find-my-combos.",
+            inputSchema: csbFindByNamesInput
+        },
+        async ({ names, fuzzy = true, limit, offset }: { names: string[]; fuzzy?: boolean; limit?: number; offset?: number }) => {
+            // Resolve names to oracle_ids via Scryfall
+            const oracleIds: string[] = [];
+            for (const name of names) {
+                try {
+                    const card: any = await Scryfall.getCardNamed(name, fuzzy);
+                    const oid = (card as any)?.oracle_id || (card as any)?.oracleId || (card as any)?.oracleID;
+                    if (typeof oid === "string") oracleIds.push(oid);
+                } catch {
+                    // ignore individual failures
+                }
+            }
+            const uniqOids = Array.from(new Set(oracleIds));
+            if (uniqOids.length === 0) return { content: [{ type: "text", text: "No oracle IDs resolved from names" }] } as any;
+
+            const mapRes = await lookupCsbIdsByOracle(uniqOids);
+            const ids = Object.values(mapRes.found);
+            if (ids.length === 0) {
+                return { structuredContent: { mapping: mapRes, results: null } } as any;
+            }
+            const combos = await CSB.findMyCombos(ids, limit, offset);
+            return { structuredContent: { mapping: mapRes, results: combos } } as any;
         }
     );
 
