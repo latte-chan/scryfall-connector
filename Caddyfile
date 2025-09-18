@@ -1,0 +1,31 @@
+{
+  admin off
+}
+
+https://localhost:3443 {
+  tls internal
+
+  # Echo CORS for preflights and normal requests
+  header {
+    Access-Control-Allow-Origin {http.request.header.Origin}
+    Vary Origin
+    Access-Control-Allow-Methods "GET, POST, OPTIONS"
+    Access-Control-Allow-Headers {http.request.header.Access-Control-Request-Headers}
+    Access-Control-Allow-Private-Network true
+  }
+
+  @preflight {
+    method OPTIONS
+  }
+  respond @preflight 204
+
+  reverse_proxy scryfall:3000 {
+    transport http {
+      versions 1.1
+      keepalive 0
+    }
+    flush_interval -1
+    header_up Host {host}
+    header_up X-Forwarded-Proto {scheme}
+  }
+}

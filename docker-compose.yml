@@ -1,0 +1,62 @@
+services:
+  scryfall:
+    build: .
+    image: scryfall-mcp:latest
+    environment:
+      - PORT=3000
+      - CORS_ORIGIN=*
+      - SCRYFALL_BASE_URL=https://api.scryfall.com
+      - CSB_BASE_URL=https://backend.commanderspellbook.com
+      # Optional cache locations
+      - TAGGER_CACHE_PATH=/data/tagger-tags.json
+      - CSB_CARD_INDEX_PATH=/data/csb-card-index.json
+      - CSB_CARD_INDEX_TTL_MS=86400000
+      - MCP_LOG_BODY=1
+    ports:
+      - "3000:3000"
+    volumes:
+      - mcp_data:/data
+    restart: unless-stopped
+    profiles: [ "prod", "http" ]
+
+  dev:
+    image: node:20-alpine
+    working_dir: /app
+    environment:
+      - PORT=3000
+      - CORS_ORIGIN=*
+      - SCRYFALL_BASE_URL=https://api.scryfall.com
+      - CSB_BASE_URL=https://backend.commanderspellbook.com
+      - TAGGER_CACHE_PATH=/data/tagger-tags.json
+      - CSB_CARD_INDEX_PATH=/data/csb-card-index.json
+      - CSB_CARD_INDEX_TTL_MS=86400000
+    command: >-
+      sh -lc "npm ci && (npx tsc -w -p tsconfig.json &) node --enable-source-maps --watch dist/sse.js"
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+      - mcp_data:/data
+      # Avoid mounting local node_modules; create inside container
+      - /app/node_modules
+    restart: unless-stopped
+    profiles: [ "dev" ]
+
+  https-proxy:
+    image: caddy:2.7
+    depends_on:
+      - scryfall
+    ports:
+      - "3443:3443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    # Only run when explicitly requested
+    profiles: [ "https" ]
+
+volumes:
+  mcp_data:
+  caddy_data:
+  caddy_config:
